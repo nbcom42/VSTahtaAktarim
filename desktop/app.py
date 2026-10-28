@@ -18,7 +18,8 @@ from PIL import Image, ImageTk
 
 # Render/Railway'e deploy ettikten sonra bu URL'yi güncelleyin
 RELAY_URL = os.environ.get('RELAY_URL', 'https://vs-tahta-relay.onrender.com')
-POLL_INTERVAL = 3  # saniye
+POLL_INTERVAL = 3   # saniye
+KEEP_ALIVE = 600    # 10 dakikada bir ping (Render 15 dk'da uyur)
 SAVE_DIR = Path.home() / 'Desktop' / 'Tahtaya_Aktarilanlar'
 
 # ─── Ana Uygulama ─────────────────────────────────────────────────────────────
@@ -29,8 +30,6 @@ class TahtaApp:
         self.session_id = None
         self.polling = False
         self.poll_thread = None
-        self.pin = tk.StringVar()
-        self.pin_enabled = tk.BooleanVar(value=False)
         self._build_ui()
 
     def _build_ui(self):
@@ -40,6 +39,10 @@ class TahtaApp:
         self.root.resizable(False, False)
         self.root.configure(bg='#0f2027')
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+        # StringVar'lar root oluştuktan sonra tanımlanmalı
+        self.pin = tk.StringVar()
+        self.pin_enabled = tk.BooleanVar(value=False)
 
         # Başlık
         tk.Label(self.root, text='📲 VS Tahta Aktarım', font=('Segoe UI', 18, 'bold'),
@@ -110,32 +113,62 @@ class TahtaApp:
         else:
             self._start_session()
 
+    def _wake_server(self):
+        """Render uyuyorsa uyandır, hazır olana kadar bekle (maks 60 sn)"""
+        self._set_status('⏳ Sunucu uyandırılıyor (ilk açılış ~30 sn)...', '#fbbf24')
+        for i in range(12):  # 12 x 5 sn = 60 sn
+            try:
+                res = requests.get(f'{RELAY_URL}/', timeout=8)
+                if res.status_code == 200:
+                    return True
+            except Exception:
+                pass
+            self._set_status(f'⏳ Sunucu uyandırılıyor... ({(i+1)*5}sn)', '#fbbf24')
+            time.sleep(5)
+        return False
+
     def _start_session(self):
         pin = self.pin.get().strip() if self.pin_enabled.get() else ''
         if self.pin_enabled.get() and (not pin.isdigit() or len(pin) != 4):
             messagebox.showwarning('PIN Hatası', '4 haneli sayısal PIN giriniz.')
             return
 
-        self._set_status('Sunucuya bağlanılıyor...', '#fbbf24')
+        self.btn.config(state='disabled')
+        threading.Thread(target=self._start_session_thread, args=(pin,), daemon=True).start()
+
+    def _start_session_thread(self, pin):
+        # Önce sunucuyu uyandır
+        if not self._wake_server():
+            self.root.after(0, lambda: self._set_status('❌ Sunucuya ulaşılamadı', '#f87171'))
+            self.root.after(0, lambda: self.btn.config(state='normal'))
+            msg = 'Sunucuya 60 saniyede ulasilamadi. Internet baglantisini kontrol edin.'
+            self.root.after(0, lambda m=msg: messagebox.showerror('Hata', m))
+            return
+
+        self._set_status('Oturum açılıyor...', '#fbbf24')
         try:
             res = requests.post(f'{RELAY_URL}/api/session/create',
-                                json={'pin': pin}, timeout=10)
+                                json={'pin': pin}, timeout=15)
             data = res.json()
             if data.get('status') != 'ok':
                 raise ValueError('Sunucu hatası')
             self.session_id = data['session_id']
         except Exception as e:
-            self._set_status(f'Bağlantı hatası: {e}', '#f87171')
-            messagebox.showerror('Hata', f'Relay sunucuya bağlanılamadı:\n{e}\n\nRELAY_URL ayarını kontrol edin.')
+            self.root.after(0, lambda: self._set_status(f'Bağlantı hatası: {e}', '#f87171'))
+            self.root.after(0, lambda: self.btn.config(state='normal'))
+            self.root.after(0, lambda: messagebox.showerror('Hata', f'Oturum açılamadı:\n{e}'))
             return
 
         upload_url = f'{RELAY_URL}/upload/{self.session_id}'
+        self.root.after(0, lambda: self._on_session_started(upload_url))
+
+    def _on_session_started(self, upload_url):
         self._show_qr(upload_url)
         self.url_label.config(text=upload_url)
         self.polling = True
-        self.btn.config(text='⏹  Oturumu Kapat', bg='#ef4444', activebackground='#dc2626')
+        self.btn.config(text='⏹  Oturumu Kapat', bg='#ef4444',
+                        activebackground='#dc2626', state='normal')
         self._set_status(f'● Aktif — Oturum: {self.session_id}', '#34d399')
-
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
 
@@ -147,8 +180,9 @@ class TahtaApp:
             except Exception:
                 pass
             self.session_id = None
-        self.btn.config(text='▶  Oturumu Başlat', bg='#3b82f6', activebackground='#2563eb')
-        self.qr_label.config(image='', text='QR kod burada\ngösterilecek')
+        self.btn.config(text='▶  Oturumu Başlat', bg='#3b82f6',
+                        activebackground='#2563eb', state='normal')
+        self.qr_label.config(image='', text='QR kod burada\ngosterilecek')
         self.url_label.config(text='')
         self._set_status('● Bekleniyor', '#94a3b8')
 
@@ -162,6 +196,7 @@ class TahtaApp:
         self.qr_label.config(image=self._qr_photo, text='')
 
     def _poll_loop(self):
+        last_ping = time.time()
         while self.polling and self.session_id:
             try:
                 res = requests.get(f'{RELAY_URL}/api/session/{self.session_id}/poll', timeout=10)
@@ -170,6 +205,13 @@ class TahtaApp:
                     self._download_file(file_info)
             except Exception:
                 pass
+            # Keep-alive: sunucunun uykuya geçmesini engelle
+            if time.time() - last_ping > KEEP_ALIVE:
+                try:
+                    requests.get(f'{RELAY_URL}/', timeout=5)
+                    last_ping = time.time()
+                except Exception:
+                    pass
             time.sleep(POLL_INTERVAL)
 
     def _download_file(self, file_info):

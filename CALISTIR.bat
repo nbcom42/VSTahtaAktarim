@@ -1,0 +1,6 @@
+@echo off
+echo Bagimliliklar kontrol ediliyor...
+pip install requests "qrcode[pil]" Pillow --quiet --disable-pip-version-check
+echo Uygulama baslatiliyor...
+python "%~dp0desktop\app.py" https://vstahtaaktarim.onrender.com
+pause
